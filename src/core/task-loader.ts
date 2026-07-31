@@ -43,7 +43,9 @@ async function listBranchTreeFiles(
 	if (includeObjectIds && typeof git.listTreeEntries === "function") {
 		return await git.listTreeEntries(ref, path);
 	}
-	return (await git.listFilesInTree(ref, path)).map((filePath) => ({ path: filePath }));
+	return (await git.listFilesInTree(ref, path)).map((filePath) => ({
+		path: filePath,
+	}));
 }
 
 function extractConfiguredTaskId(filePath: string, prefix: string): string | null {
@@ -57,6 +59,7 @@ const STATE_DIRECTORIES: Array<{ path: string; type: TaskDirectoryType }> = [
 	{ path: "tasks", type: "task" },
 	{ path: "drafts", type: "draft" },
 	{ path: "archive/tasks", type: "archived" },
+	{ path: "archive/drafts", type: "archived" },
 	{ path: "completed", type: "completed" },
 ];
 
@@ -183,7 +186,13 @@ export async function buildRemoteTaskIndex(
 					const id = extractConfiguredTaskId(f, prefix);
 					if (!id) continue;
 					const lastModified = lm.get(f) ?? new Date(0);
-					const entry: RemoteIndexEntry = { id, branch: br, path: f, lastModified, commit };
+					const entry: RemoteIndexEntry = {
+						id,
+						branch: br,
+						path: f,
+						lastModified,
+						commit,
+					};
 
 					// Collect full state info when requested
 					const type = getTaskTypeFromPath(f, backlogDir);
@@ -319,7 +328,13 @@ export async function buildLocalBranchTaskIndex(
 					const id = extractConfiguredTaskId(f, prefix);
 					if (!id) continue;
 					const lastModified = lm.get(f) ?? new Date(0);
-					const entry: RemoteIndexEntry = { id, branch: br, path: f, lastModified, commit };
+					const entry: RemoteIndexEntry = {
+						id,
+						branch: br,
+						path: f,
+						lastModified,
+						commit,
+					};
 
 					// Collect full state info when requested
 					const type = getTaskTypeFromPath(f, backlogDir);
@@ -370,7 +385,12 @@ function chooseWinners(
 	remoteIndex: Map<string, RemoteIndexEntry[]>,
 	strategy: "most_recent" | "most_progressed" = "most_progressed",
 ): Array<{ id: string; ref: string; path: string; commit?: string }> {
-	const winners: Array<{ id: string; ref: string; path: string; commit?: string }> = [];
+	const winners: Array<{
+		id: string;
+		ref: string;
+		path: string;
+		commit?: string;
+	}> = [];
 
 	for (const [id, entries] of remoteIndex) {
 		const local = localById.get(id);
@@ -378,7 +398,12 @@ function chooseWinners(
 		if (!local) {
 			// No local version - take the newest remote
 			const best = entries.reduce((a, b) => (a.lastModified >= b.lastModified ? a : b));
-			winners.push({ id, ref: `origin/${best.branch}`, path: best.path, commit: best.commit });
+			winners.push({
+				id,
+				ref: `origin/${best.branch}`,
+				path: best.path,
+				commit: best.commit,
+			});
 			continue;
 		}
 
@@ -580,7 +605,12 @@ export async function loadRemoteTasks(
 		onProgress?.(`Found ${remoteIndex.size} unique tasks across remote branches`);
 
 		// If we have local tasks, use them to determine which remote tasks to hydrate
-		let winners: Array<{ id: string; ref: string; path: string; commit?: string }>;
+		let winners: Array<{
+			id: string;
+			ref: string;
+			path: string;
+			commit?: string;
+		}>;
 
 		if (localTasks && localTasks.length > 0) {
 			const localById = new Map(localTasks.map((t) => [normalizeTaskId(t.id), t]));
@@ -594,7 +624,12 @@ export async function loadRemoteTasks(
 			winners = [];
 			for (const [id, entries] of remoteIndex) {
 				const best = entries.reduce((a, b) => (a.lastModified >= b.lastModified ? a : b));
-				winners.push({ id, ref: `origin/${best.branch}`, path: best.path, commit: best.commit });
+				winners.push({
+					id,
+					ref: `origin/${best.branch}`,
+					path: best.path,
+					commit: best.commit,
+				});
 			}
 			onProgress?.(`Hydrating ${winners.length} remote tasks...`);
 		}
@@ -711,7 +746,12 @@ export async function loadLocalBranchTasks(
 		onProgress?.(`Found ${localBranchIndex.size} unique tasks in other local branches`);
 
 		// Determine which tasks to hydrate
-		let winners: Array<{ id: string; ref: string; path: string; commit?: string }>;
+		let winners: Array<{
+			id: string;
+			ref: string;
+			path: string;
+			commit?: string;
+		}>;
 
 		if (localTasks && localTasks.length > 0) {
 			const localById = new Map(localTasks.map((t) => [normalizeTaskId(t.id), t]));
@@ -725,7 +765,12 @@ export async function loadLocalBranchTasks(
 				if (!local) {
 					// Task doesn't exist locally - take the newest from other branches
 					const best = entries.reduce((a, b) => (a.lastModified >= b.lastModified ? a : b));
-					winners.push({ id, ref: best.branch, path: best.path, commit: best.commit });
+					winners.push({
+						id,
+						ref: best.branch,
+						path: best.path,
+						commit: best.commit,
+					});
 					continue;
 				}
 
@@ -735,7 +780,12 @@ export async function loadLocalBranchTasks(
 					const newestOther = entries.reduce((a, b) => (a.lastModified >= b.lastModified ? a : b));
 
 					if (newestOther.lastModified.getTime() > localTs) {
-						winners.push({ id, ref: newestOther.branch, path: newestOther.path, commit: newestOther.commit });
+						winners.push({
+							id,
+							ref: newestOther.branch,
+							path: newestOther.path,
+							commit: newestOther.commit,
+						});
 					}
 				} else {
 					// For most_progressed, we need to hydrate to check status
@@ -744,7 +794,12 @@ export async function loadLocalBranchTasks(
 
 					if (maybeNewer) {
 						const newestOther = entries.reduce((a, b) => (a.lastModified >= b.lastModified ? a : b));
-						winners.push({ id, ref: newestOther.branch, path: newestOther.path, commit: newestOther.commit });
+						winners.push({
+							id,
+							ref: newestOther.branch,
+							path: newestOther.path,
+							commit: newestOther.commit,
+						});
 					}
 				}
 			}
@@ -753,7 +808,12 @@ export async function loadLocalBranchTasks(
 			winners = [];
 			for (const [id, entries] of localBranchIndex) {
 				const best = entries.reduce((a, b) => (a.lastModified >= b.lastModified ? a : b));
-				winners.push({ id, ref: best.branch, path: best.path, commit: best.commit });
+				winners.push({
+					id,
+					ref: best.branch,
+					path: best.path,
+					commit: best.commit,
+				});
 			}
 		}
 

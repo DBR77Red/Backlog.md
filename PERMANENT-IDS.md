@@ -45,6 +45,16 @@ An ID is issued **at most once for the life of a project**.
 Concretely: the ID pool is the union of active, completed, **archived** and **draft** IDs, and
 promotion/demotion move a file between folders without touching its ID.
 
+**The pool is also branch- and worktree-wide.** Allocation scans every local branch regardless
+of `check_active_branches`/`active_branch_days` (those tune board/browser *loading*, not
+allocation — an ID issued on any branch is permanently taken, and a collision would surface
+only at merge time), remote branches unless `remote_operations: false`, and every sibling
+worktree's backlog folders including `drafts/` and `archive/` — so an uncommitted draft in
+another worktree already reserves its number. Upstream's allocator kept only IDs whose *latest*
+state was active or completed, which let an ID that existed purely as a draft or an archived
+item on another branch be silently reissued; this fork counts every ID seen anywhere, in any
+state.
+
 ## What this fork does *not* change
 
 This is the important half, because these are the behaviours people rely on:
@@ -80,6 +90,10 @@ that removes an item from the board also removes its ID from the pool.
 `src/test/permanent-ids.test.ts` locks the invariants: drafts allocate from the task pool, promotion
 and demotion preserve the ID, archived tasks *and* archived drafts stay reserved, an unpromoted draft
 occupies its number, and drafts follow a custom task prefix.
+`src/test/cross-branch-id-allocation.test.ts` locks the branch/worktree half: a task, a draft or an
+archived item that exists only on another branch reserves its ID (even with
+`check_active_branches: false`), an *uncommitted* draft in a sibling worktree reserves its ID, and a
+branch older than `active_branch_days` still counts.
 
 One of those tests earns its place. An early version of this patch wrote draft files as
 `draft-task-2 - Title.md` — the `draft-` prefix was being prepended to an ID that already said

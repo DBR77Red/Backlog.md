@@ -72,6 +72,7 @@ import { upsertTaskUpdatedDate } from "../utils/task-updated-date.ts";
 import { isTerminalStatus } from "../utils/terminal-status.ts";
 import { migrateConfig, needsMigration } from "./config-migration.ts";
 import { ContentStore } from "./content-store.ts";
+import type { TaskDirectoryType } from "./cross-branch-tasks.ts";
 import {
 	applyDuplicateTaskIdRepair,
 	type DuplicateRepairPlan,
@@ -220,18 +221,11 @@ function normalizeDocumentTypeInput(type: unknown): DocumentType | undefined {
 }
 
 /**
- * Extract IDs from state map where latest state is "task" or "completed" (not "archived" or "draft")
- * Used for ID generation to determine which IDs are in use.
+ * Branch window used when scanning branches for ID ALLOCATION (not board loading).
+ * An ID issued on any branch is permanently taken, so allocation must see stale
+ * branches too — activeBranchDays only tunes board/browser loading performance.
  */
-function getActiveAndCompletedIdsFromStateMap(latestState: Map<string, BranchTaskStateEntry>): string[] {
-	const ids: string[] = [];
-	for (const [id, entry] of latestState) {
-		if (entry.type === "task" || entry.type === "completed") {
-			ids.push(id);
-		}
-	}
-	return ids;
-}
+const ID_ALLOCATION_BRANCH_WINDOW_DAYS = 36500;
 
 function formatAvailableIndexHint(items: AcceptanceCriterion[], emptyMessage: string): string {
 	if (items.length === 0) {
@@ -1049,8 +1043,11 @@ export class Core {
 	 * @returns The next available ID (e.g., "task-42", "draft-5", "doc-3")
 	 *
 	 * Folder scanning by type:
-	 * - Task: /tasks, /completed, cross-branch (if enabled), remote (if enabled)
-	 * - Draft: /drafts only
+	 * - Task / Draft (one shared pool): /tasks, /drafts, /completed and /archive
+	 *   locally, the same folders in every sibling worktree (uncommitted files
+	 *   count), and every local branch regardless of checkActiveBranches (remote
+	 *   branches too unless remoteOperations is false). An ID seen anywhere, in
+	 *   any state, is permanently taken.
 	 * - Document: /documents only
 	 * - Decision: /decisions only
 	 */
@@ -1071,10 +1068,10 @@ export class Core {
 	}
 
 	/**
-	 * Gets all task IDs that are in use (active or completed) across all branches.
-	 * Respects cross-branch config settings. Archived IDs are excluded (can be reused).
-	 *
-	 * This is used for ID generation to determine the next available ID.
+	 * Collects task/draft/completed/archived state entries from every sibling
+	 * worktree's backlog folders. This reads the worktree FILESYSTEM, so files
+	 * not yet committed on the worktree's branch still count. Used by ID
+	 * allocation only.
 	 */
 	private async loadWorktreeTaskStateEntries(taskPrefix: string): Promise<BranchTaskStateEntry[]> {
 		const [repoRoot, worktreeRoots] = await Promise.all([this.git.getRepositoryRoot(), this.git.listWorktreePaths()]);
@@ -1105,9 +1102,27 @@ export class Core {
 	): Promise<BranchTaskStateEntry[]> {
 		const idRegex = buildIdRegex(taskPrefix);
 		const globPattern = buildGlobPattern(taskPrefix.toLowerCase());
-		const directories: Array<{ path: string; type: "task" | "completed" }> = [
-			{ path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.TASKS), type: "task" },
-			{ path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.COMPLETED), type: "completed" },
+		const directories: Array<{ path: string; type: TaskDirectoryType }> = [
+			{
+				path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.TASKS),
+				type: "task",
+			},
+			{
+				path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.COMPLETED),
+				type: "completed",
+			},
+			{
+				path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.DRAFTS),
+				type: "draft",
+			},
+			{
+				path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.ARCHIVE_TASKS),
+				type: "archived",
+			},
+			{
+				path: join(projectRoot, backlogDir, DEFAULT_DIRECTORIES.ARCHIVE_DRAFTS),
+				type: "archived",
+			},
 		];
 		const entries: BranchTaskStateEntry[] = [];
 
@@ -1138,7 +1153,16 @@ export class Core {
 		return entries;
 	}
 
-	private async getActiveAndCompletedTaskIds(): Promise<string[]> {
+	/**
+	 * Gets every task/draft ID known anywhere in the repository: local folders,
+	 * every sibling worktree's folders (committed or not), and every branch.
+	 *
+	 * Deliberately ignores checkActiveBranches and activeBranchDays: those tune
+	 * board/browser LOADING, but an ID issued on any branch is permanently taken,
+	 * and a collision would surface only at merge time — long after both sides
+	 * exist. Used by ID allocation only.
+	 */
+	private async getAllKnownTaskIds(): Promise<string[]> {
 		const config = await this.fs.loadConfig();
 		const taskPrefix = config?.prefixes?.task ?? "task";
 
@@ -1179,24 +1203,28 @@ export class Core {
 		// task files are committed, so include their filesystem state for allocation.
 		stateEntries.push(...(await this.loadWorktreeTaskStateEntries(taskPrefix)));
 
-		// If cross-branch checking is enabled, scan other branches for task states
-		if (config?.checkActiveBranches !== false) {
-			const branchStateEntries: BranchTaskStateEntry[] = [];
-			const backlogDir = await this.getBacklogDirectoryName();
+		// Scan other branches unconditionally (see the docstring) under a wide
+		// window, so IDs on branches older than activeBranchDays stay reserved.
+		// remoteOperations=false still short-circuits the remote scan inside
+		// loadRemoteTasks; filesystemOnly still short-circuits branch listing.
+		const branchStateEntries: BranchTaskStateEntry[] = [];
+		const backlogDir = await this.getBacklogDirectoryName();
+		const allocationConfig = config ? { ...config, activeBranchDays: ID_ALLOCATION_BRANCH_WINDOW_DAYS } : config;
 
-			// Load states from remote and local branches in parallel
-			await Promise.all([
-				loadRemoteTasks(this.git, config, undefined, localTasks, branchStateEntries, false, backlogDir),
-				loadLocalBranchTasks(this.git, config, undefined, localTasks, branchStateEntries, false, backlogDir),
-			]);
+		// Load states from remote and local branches in parallel
+		await Promise.all([
+			loadRemoteTasks(this.git, allocationConfig, undefined, localTasks, branchStateEntries, false, backlogDir),
+			loadLocalBranchTasks(this.git, allocationConfig, undefined, localTasks, branchStateEntries, false, backlogDir),
+		]);
 
-			// Add branch state entries
-			stateEntries.push(...branchStateEntries);
-		}
+		// Add branch state entries
+		stateEntries.push(...branchStateEntries);
 
-		// Build the latest state map and extract active + completed IDs
-		const latestState = buildLatestStateMap(stateEntries, []);
-		return getActiveAndCompletedIdsFromStateMap(latestState);
+		// The pool is the union of every ID seen in ANY state (task, draft,
+		// completed, archived) on any branch or worktree — never a filtered
+		// "latest state wins" view, which would let a draft-only or archived-only
+		// ID escape the pool and be reissued.
+		return [...new Set(stateEntries.map((entry) => entry.id))];
 	}
 
 	/**
@@ -1213,7 +1241,7 @@ export class Core {
 			case EntityType.Task:
 			case EntityType.Draft: {
 				const [activeAndCompleted, drafts, archivedTasks, archivedDrafts] = await Promise.all([
-					this.getActiveAndCompletedTaskIds(),
+					this.getAllKnownTaskIds(),
 					this.fs.listDrafts(),
 					this.fs.listArchivedTasks(),
 					this.fs.listArchivedDrafts(),
@@ -1365,10 +1393,18 @@ export class Core {
 					input.milestone.trim().length > 0 && {
 						milestone: input.milestone.trim(),
 					}),
-				...(typeof input.description === "string" && { description: input.description }),
-				...(typeof input.implementationPlan === "string" && { implementationPlan: input.implementationPlan }),
-				...(typeof input.implementationNotes === "string" && { implementationNotes: input.implementationNotes }),
-				...(typeof input.finalSummary === "string" && { finalSummary: input.finalSummary }),
+				...(typeof input.description === "string" && {
+					description: input.description,
+				}),
+				...(typeof input.implementationPlan === "string" && {
+					implementationPlan: input.implementationPlan,
+				}),
+				...(typeof input.implementationNotes === "string" && {
+					implementationNotes: input.implementationNotes,
+				}),
+				...(typeof input.finalSummary === "string" && {
+					finalSummary: input.finalSummary,
+				}),
 				...(acceptanceCriteriaItems.length > 0 && { acceptanceCriteriaItems }),
 				...(definitionOfDoneItems && definitionOfDoneItems.length > 0 && { definitionOfDoneItems }),
 			};
@@ -2123,7 +2159,9 @@ export class Core {
 				status: canonicalStatus,
 				filePath: undefined,
 				...(mutated || draft.status !== canonicalStatus
-					? { updatedDate: new Date().toISOString().slice(0, 16).replace("T", " ") }
+					? {
+							updatedDate: new Date().toISOString().slice(0, 16).replace("T", " "),
+						}
 					: {}),
 			};
 
@@ -2170,7 +2208,9 @@ export class Core {
 				status: "Draft",
 				filePath: undefined,
 				...(mutated || task.status !== "Draft"
-					? { updatedDate: new Date().toISOString().slice(0, 16).replace("T", " ") }
+					? {
+							updatedDate: new Date().toISOString().slice(0, 16).replace("T", " "),
+						}
 					: {}),
 			};
 
@@ -2190,7 +2230,12 @@ export class Core {
 			await this.git.commitChanges(`backlog: Demote task ${normalizeTaskId(task.id)}`, repoRoot);
 		}
 
-		return (await this.fs.loadDraft(demotedDraft.id)) ?? { ...demotedDraft, filePath: savedPath };
+		return (
+			(await this.fs.loadDraft(demotedDraft.id)) ?? {
+				...demotedDraft,
+				filePath: savedPath,
+			}
+		);
 	}
 
 	/**
@@ -2415,7 +2460,12 @@ export class Core {
 	async archiveMilestone(
 		identifier: string,
 		autoCommit?: boolean,
-	): Promise<{ success: boolean; sourcePath?: string; targetPath?: string; milestone?: Milestone }> {
+	): Promise<{
+		success: boolean;
+		sourcePath?: string;
+		targetPath?: string;
+		milestone?: Milestone;
+	}> {
 		const result = await this.fs.archiveMilestone(identifier);
 
 		if (result.success && result.sourcePath && result.targetPath && (await this.shouldAutoCommit(autoCommit))) {
@@ -2612,7 +2662,11 @@ export class Core {
 		let nextIndex = current.length > 0 ? Math.max(...current.map((c) => c.index)) + 1 : 1;
 
 		// Append new criteria
-		const newCriteria = criteria.map((text) => ({ index: nextIndex++, text, checked: false }));
+		const newCriteria = criteria.map((text) => ({
+			index: nextIndex++,
+			text,
+			checked: false,
+		}));
 		task.acceptanceCriteriaItems = [...current, ...newCriteria];
 
 		// Save the task
@@ -2792,7 +2846,9 @@ export class Core {
 				type: existingDoc.type,
 				tags: existingDoc.tags,
 				content,
-				...(existingDoc.path !== undefined && { path: getDocumentSubPathFromRelativePath(existingDoc.path) }),
+				...(existingDoc.path !== undefined && {
+					path: getDocumentSubPathFromRelativePath(existingDoc.path),
+				}),
 			},
 			autoCommit,
 		);
@@ -3008,9 +3064,12 @@ export class Core {
 	 * Load and process all tasks with the same logic as CLI overview
 	 * This method extracts the common task loading logic for reuse
 	 */
-	async loadAllTasksForStatistics(
-		progressCallback?: (msg: string) => void,
-	): Promise<{ tasks: Task[]; drafts: Task[]; statuses: string[]; priorities: string[] }> {
+	async loadAllTasksForStatistics(progressCallback?: (msg: string) => void): Promise<{
+		tasks: Task[];
+		drafts: Task[];
+		statuses: string[];
+		priorities: string[];
+	}> {
 		const config = await this.fs.loadConfig();
 		const statuses = (config?.statuses || DEFAULT_STATUSES) as string[];
 		const priorities = config?.priorities ?? [];
@@ -3045,7 +3104,10 @@ export class Core {
 		// Add completed tasks to the map
 		for (const completedTask of completedTasks) {
 			if (!tasksById.has(completedTask.id)) {
-				tasksById.set(completedTask.id, { ...completedTask, source: "completed" });
+				tasksById.set(completedTask.id, {
+					...completedTask,
+					source: "completed",
+				});
 			}
 		}
 
@@ -3087,7 +3149,12 @@ export class Core {
 		progressCallback?.("Loading drafts...");
 		const drafts = await this.fs.listDrafts();
 
-		return { tasks: activeTasks, drafts, statuses: statuses as string[], priorities };
+		return {
+			tasks: activeTasks,
+			drafts,
+			statuses: statuses as string[],
+			priorities,
+		};
 	}
 
 	/**
@@ -3179,7 +3246,10 @@ export class Core {
 		// Add local completed tasks when requested
 		if (includeCompleted) {
 			for (const completedTask of completedTasks) {
-				tasksById.set(completedTask.id, { ...completedTask, source: "completed" });
+				tasksById.set(completedTask.id, {
+					...completedTask,
+					source: "completed",
+				});
 			}
 		}
 
